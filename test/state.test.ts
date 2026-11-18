@@ -1,0 +1,382 @@
+import { strict as assert } from 'node:assert';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { test } from 'node:test';
+import { GitlabState, ROOT_BUCKET, STATE_VERSION, type GitlabStateSnapshot } from '../src/state.js';
+import { POLL_DEDUP_RING, POLL_HEAD_MEMORY, type Logger } from '../src/types.js';
+const REPO = 'group/project';
+function tempFile(name = 'state.json'): string {
+    return join(mkdtempSync(join(tmpdir(), 'gitlab-mcpl-state-')), name);
+}
+function capturingLogger(): Logger & {
+    lines: string[];
+} {
+    const lines: string[] = [];
+    const push = (level: string) => (message: string) => {
+        lines.push(`${level} ${message}`);
+    };
+    return {
+        lines, debug: push('debug'), info: push('info'), warn: push('warn'), error: push('error')
+    };
+}
+function readSnapshot(file: string): GitlabStateSnapshot {
+    return JSON.parse(readFileSync(file, 'utf8')) as GitlabStateSnapshot;
+}
+function strayTempFiles(file: string): string[] {
+    const dir = join(file, '..');
+    return readdirSync(dir).filter((n) => n.includes('.tmp-'));
+}
+test('checkpoints form a lineage, and a rollback branches it', async () => {
+    const state = GitlabState.empty();
+    assert.equal(state.current(), null);
+    const first = state.createCheckpoint();
+    const second = state.createCheckpoint();
+    assert.equal(first.parent, null);
+    assert.equal(second.parent, first.id);
+    assert.equal(state.current(), second.id);
+    assert.ok(Date.parse(first.createdAt) > 0);
+    assert.deepEqual(state.lineage().map((c) => [c.id, c.parent]), [
+        [first.id, null],
+        [second.id, first.id],
+    ]);
+    assert.ok(state.rollback(first.id));
+    assert.equal(state.current(), first.id);
+    const branch = state.createCheckpoint();
+    assert.equal(branch.parent, first.id);
+    assert.equal(state.lineage().length, 3);
+    assert.deepEqual(state.lineage().filter((c) => c.parent === first.id).map((c) => c.id), [second.id, branch.id]);
+});
+test('an unknown checkpoint plans nothing (the caller answers -32005)', () => {
+    const state = GitlabState.empty();
+    state.createCheckpoint();
+    assert.equal(state.rollback('chk_nope'), null);
+});
+test('rollback plans the writes recorded after the checkpoint, newest first', () => {
+    const state = GitlabState.empty();
+    const base = state.createCheckpoint();
+    state.recordCreatedComment({
+        repo: REPO, commentId: 11, review: false, thread: { number: 7, kind: 'issue' }
+    });
+    const afterFirst = state.createCheckpoint();
+    state.recordCreatedComment({
+        repo: REPO, commentId: 12, review: true, thread: { number: 7, kind: 'mr' }
+    });
+    state.recordEditedComment({
+        repo: REPO, commentId: 5, previousBody: 'before', review: false
+    });
+    state.createCheckpoint();
+    state.recordDeletedComment({
+        repo: REPO, commentId: 6, previousBody: 'gone', review: false
+    });
+    const plan = state.rollback(base.id);
+    assert.ok(plan);
+    assert.deepEqual(plan.created.map((c) => c.commentId), [12, 11]);
+    assert.equal(plan.created[0].review, true);
+    assert.deepEqual(plan.created[1].thread, { number: 7, kind: 'issue' });
+    assert.deepEqual(plan.edited.map((e) => [e.commentId, e.previousBody]), [[5, 'before']]);
+    assert.deepEqual(plan.deleted.map((d) => d.commentId), [6]);
+    const again = state.rollback(base.id);
+    assert.ok(again);
+    assert.deepEqual(again, {
+        created: [], edited: [], deleted: []
+    });
+    assert.equal(state.checkpointStatus(afterFirst.id), 'abandoned');
+    assert.equal(state.rollback(afterFirst.id), null);
+});
+test('a rollback leaves alone what was written before the checkpoint existed', () => {
+    const state = GitlabState.empty();
+    state.recordCreatedComment({
+        repo: REPO, commentId: 1, review: false
+    });
+    const base = state.createCheckpoint();
+    state.recordCreatedComment({
+        repo: REPO, commentId: 2, review: false
+    });
+    const plan = state.rollback(base.id);
+    assert.ok(plan);
+    assert.deepEqual(plan.created.map((c) => c.commentId), [2]);
+    assert.deepEqual(state.snapshot().created[ROOT_BUCKET].map((c) => c.commentId), [1]);
+});
+test('two edits of one comment restore the oldest body last', () => {
+    const state = GitlabState.empty();
+    const base = state.createCheckpoint();
+    state.recordEditedComment({
+        repo: REPO, commentId: 5, previousBody: 'first', review: false
+    });
+    state.recordEditedComment({
+        repo: REPO, commentId: 5, previousBody: 'second', review: false
+    });
+    const plan = state.rollback(base.id);
+    assert.ok(plan);
+    assert.deepEqual(plan.edited.map((e) => e.previousBody), ['second', 'first']);
+});
+test('flush writes a versioned state file atomically and leaves no temp file', async () => {
+    const file = tempFile();
+    const state = GitlabState.load(file);
+    const cp = state.createCheckpoint();
+    state.recordCreatedComment({
+        repo: REPO, commentId: 11, review: false
+    });
+    state.setLastPollAt('2026-10-14T00:00:00.000Z');
+    await state.flush();
+    const written = readSnapshot(file);
+    assert.equal(written.version, STATE_VERSION);
+    assert.equal(written.current, cp.id);
+    assert.deepEqual(written.created[cp.id].map((c) => c.commentId), [11]);
+    assert.equal(written.lastPollAt, '2026-10-14T00:00:00.000Z');
+    assert.deepEqual(strayTempFiles(file), []);
+    assert.equal(statSync(file).mode & 0o077, 0);
+});
+test('a flushed state reloads with its lineage and its rollback reach', async () => {
+    const file = tempFile();
+    const first = GitlabState.load(file);
+    const base = first.createCheckpoint();
+    first.recordCreatedComment({
+        repo: REPO, commentId: 11, review: false, thread: { number: 7, kind: 'issue' }
+    });
+    first.createCheckpoint();
+    first.recordEditedComment({
+        repo: REPO, commentId: 5, previousBody: 'before', review: false
+    });
+    await first.flush();
+    const reloaded = GitlabState.load(file);
+    assert.equal(reloaded.lineage().length, 2);
+    assert.equal(reloaded.current(), first.current());
+    const plan = reloaded.rollback(base.id);
+    assert.ok(plan);
+    assert.deepEqual(plan.created.map((c) => c.commentId), [11]);
+    assert.deepEqual(plan.edited.map((e) => e.previousBody), ['before']);
+});
+test('a crash between the write and the rename never replaces the state', () => {
+    const file = tempFile();
+    // node:fs/promises' named exports, as state.ts imports them, follow a change
+    // to its CommonJS exports only once syncBuiltinESMExports() has run.
+    const firstFlush = `${file}.first-flush`;
+    const crash = `
+    import { copyFileSync } from 'node:fs';
+    import { createRequire, syncBuiltinESMExports } from 'node:module';
+    import { GitlabState } from ${JSON.stringify(new URL('../src/state.ts', import.meta.url).href)};
+    const state = GitlabState.load(${JSON.stringify(file)});
+    state.createCheckpoint();
+    state.recordCreatedComment({ repo: ${JSON.stringify(REPO)}, commentId: 11, review: false });
+    await state.flush();
+    copyFileSync(${JSON.stringify(file)}, ${JSON.stringify(firstFlush)});
+    createRequire(import.meta.url)('node:fs/promises').rename = () => process.exit(7);
+    syncBuiltinESMExports();
+    state.recordCreatedComment({ repo: ${JSON.stringify(REPO)}, commentId: 12, review: false });
+    await state.flush();
+  `;
+    const r = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', crash], { encoding: 'utf8' });
+    assert.equal(r.status, 7, `the second flush should have stopped at its rename:\n${r.stderr}`);
+    assert.equal(readFileSync(file, 'utf8'), readFileSync(firstFlush, 'utf8'), 'the state file is the first flush\'s, byte for byte');
+    const reloaded = GitlabState.load(file);
+    const [cp] = reloaded.lineage();
+    assert.deepEqual(reloaded.rollback(cp.id)?.created.map((c) => c.commentId), [11]);
+});
+test('concurrent flushes serialize and the file always parses', async () => {
+    const file = tempFile();
+    const state = GitlabState.load(file);
+    state.createCheckpoint();
+    const flushes = [state.flush(), state.flush(), state.flush()];
+    state.setLastPollAt('2026-10-14T01:00:00.000Z');
+    flushes.push(state.flush());
+    await Promise.all(flushes);
+    assert.equal(readSnapshot(file).lastPollAt, '2026-10-14T01:00:00.000Z');
+    assert.deepEqual(strayTempFiles(file), []);
+});
+test('a damaged or foreign state file starts empty with one stderr line', () => {
+    const broken = tempFile();
+    writeFileSync(broken, '{"version":1,"checkpoints":[');
+    const log = capturingLogger();
+    const fromBroken = GitlabState.load(broken, log);
+    assert.deepEqual(fromBroken.lineage(), []);
+    assert.equal(log.lines.length, 1);
+    assert.match(log.lines[0], /^warn state: .*not valid JSON/);
+    const future = tempFile();
+    writeFileSync(future, JSON.stringify({ version: STATE_VERSION + 1, checkpoints: [{ id: 'chk_x' }] }));
+    const futureLog = capturingLogger();
+    assert.deepEqual(GitlabState.load(future, futureLog).lineage(), []);
+    assert.match(futureLog.lines[0], /not a version 1 snapshot/);
+    const fresh = capturingLogger();
+    const absent = tempFile();
+    assert.deepEqual(GitlabState.load(absent, fresh).lineage(), []);
+    assert.deepEqual(fresh.lines, []);
+});
+test('without a state file the store works in memory and flush is a no-op', async () => {
+    const state = GitlabState.empty();
+    const cp = state.createCheckpoint();
+    state.recordCreatedComment({
+        repo: REPO, commentId: 11, review: false
+    });
+    await state.flush();
+    assert.equal(state.file, null);
+    assert.equal(state.current(), cp.id);
+});
+test('the poll dedup ring remembers the last 2000 keys and no more', () => {
+    const state = GitlabState.empty();
+    assert.equal(state.lastPollAt(), null);
+    state.setLastPollAt('2026-10-14T00:00:00.000Z');
+    assert.equal(state.lastPollAt(), '2026-10-14T00:00:00.000Z');
+    assert.equal(state.seenPollKey('comment:1:t0'), false);
+    assert.equal(state.seenPollKey('comment:1:t0'), true);
+    // GitLab stamps an edit with a new updated_at, to the second, so an edit
+    // in a later second has a new key and isn't a replay.
+    assert.equal(state.seenPollKey('comment:1:t1'), false);
+    for (let i = 0; i < POLL_DEDUP_RING; i++)
+        state.seenPollKey(`issue:${i}:t`);
+    assert.equal(state.snapshot().pollKeys.length, POLL_DEDUP_RING);
+    assert.equal(state.seenPollKey('comment:1:t0'), false);
+    assert.equal(state.seenPollKey(`issue:${POLL_DEDUP_RING - 1}:t`), true);
+});
+test('the polled heads are bounded, oldest out first, and re-recording a head refreshes its place', async () => {
+    const state = GitlabState.empty();
+    assert.equal(state.polledHead('gitlab:group/project!58'), null);
+    state.setPolledHead('gitlab:group/project!58', 'a'.repeat(40));
+    assert.equal(state.polledHead('gitlab:group/project!58'), 'a'.repeat(40));
+    state.setPolledHead('gitlab:group/project!58', 'b'.repeat(40));
+    assert.equal(state.polledHead('gitlab:group/project!58'), 'b'.repeat(40));
+    for (let i = 0; i < POLL_HEAD_MEMORY; i++)
+        state.setPolledHead(`gitlab:${REPO}!${1000 + i}`, 'c'.repeat(40));
+    assert.equal(Object.keys(state.snapshot().pollHeads).length, POLL_HEAD_MEMORY);
+    assert.equal(state.polledHead('gitlab:group/project!58'), null);
+    assert.equal(state.polledHead(`gitlab:${REPO}!${1000 + POLL_HEAD_MEMORY - 1}`), 'c'.repeat(40));
+    const oldest = `gitlab:${REPO}!1000`;
+    state.setPolledHead(oldest, 'c'.repeat(40));
+    state.setPolledHead(`gitlab:${REPO}!9999`, 'd'.repeat(40));
+    assert.equal(state.polledHead(oldest), 'c'.repeat(40));
+    assert.equal(state.polledHead(`gitlab:${REPO}!1001`), null);
+});
+test('a state file without a head map still loads, with no heads known', () => {
+    const file = tempFile();
+    writeFileSync(file, JSON.stringify({
+        version: STATE_VERSION,
+        checkpoints: [],
+        current: null,
+        created: {},
+        edited: {},
+        deleted: {},
+        lastPollAt: '2026-10-14T00:00:00.000Z',
+        pollKeys: ['issue:1:t0'],
+    }));
+    const log = capturingLogger();
+    const state = GitlabState.load(file, log);
+    assert.equal(state.lastPollAt(), '2026-10-14T00:00:00.000Z');
+    assert.equal(state.seenPollKey('issue:1:t0'), true);
+    assert.deepEqual(state.snapshot().pollHeads, {});
+    assert.deepEqual(state.pollCursors(), {});
+    assert.deepEqual(state.polledNew(), {});
+    assert.deepEqual(log.lines, []);
+});
+test('poll cursors and announced rows round-trip through a flush, and a cursor without an instant is dropped', async () => {
+    const file = tempFile();
+    const first = GitlabState.load(file, capturingLogger());
+    first.setPollCursors({
+        'group/project:issues': { since: '2026-10-14T00:00:00.000Z', resumeAt: '2026-10-14T06:00:00Z' },
+        'group/project:issue_comments': { since: '2026-10-14T07:00:00.000Z' },
+    });
+    first.setPolledNew({ 'group/project:issues': { '7': '2026-10-14T01:00:00Z' } });
+    await first.flush();
+    const onDisk = JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>;
+    onDisk.pollCursors = {
+        ...(onDisk.pollCursors as object),
+        'x/y:issues': { resumeAt: '2026-10-14T06:00:00Z' },
+        'x/y:issue_comments': 'w',
+        'x/y:review_comments': null,
+        'x/z:issues': { since: 'not a time' },
+        'x/z:issue_comments': { since: '2026-10-14T07:00:00.000Z', resumeAt: 'not a time' },
+    };
+    onDisk.pollNew = {
+        ...(onDisk.pollNew as object),
+        'x/y:issues': ['a'],
+        'x/z:issues': { '3': 5, '4': '2026-10-14T02:00:00Z' },
+    };
+    writeFileSync(file, JSON.stringify(onDisk));
+    const loaded = GitlabState.load(file, capturingLogger());
+    assert.deepEqual(loaded.pollCursors(), {
+        'group/project:issues': { since: '2026-10-14T00:00:00.000Z', resumeAt: '2026-10-14T06:00:00Z' },
+        'group/project:issue_comments': { since: '2026-10-14T07:00:00.000Z' },
+        'x/z:issue_comments': { since: '2026-10-14T07:00:00.000Z' },
+    });
+    assert.deepEqual(loaded.polledNew(), {
+        'group/project:issues': { '7': '2026-10-14T01:00:00Z' },
+        'x/y:issues': {},
+        'x/z:issues': { '4': '2026-10-14T02:00:00Z' },
+    });
+});
+test('a lastPollAt that is not an instant loads as none, says so, and keeps the rest, cursors included', () => {
+    const file = tempFile();
+    const checkpoint = {
+        id: 'chk_1', parent: null, createdAt: '2026-10-14T00:00:00.000Z'
+    };
+    writeFileSync(file, JSON.stringify({
+        version: STATE_VERSION, checkpoints: [checkpoint], current: 'chk_1', created: {}, edited: {}, deleted: {}, lastPollAt: 'soon', pollKeys: ['issue:1:t0'], pollCursors: { 'x/y:issues': { since: '2026-10-14T00:00:00.000Z' } }
+    }));
+    const log = capturingLogger();
+    const state = GitlabState.load(file, log);
+    assert.equal(state.lastPollAt(), null);
+    assert.equal(state.current(), 'chk_1');
+    assert.equal(state.seenPollKey('issue:1:t0'), true);
+    assert.deepEqual(state.pollCursors(), { 'x/y:issues': { since: '2026-10-14T00:00:00.000Z' } });
+    assert.equal(log.lines.length, 1);
+    assert.match(log.lines[0], /lastPollAt that isn't a time/);
+});
+test('a lastPollAt that is null or left out loads quietly', () => {
+    for (const lastPollAt of [null, undefined]) {
+        const file = tempFile();
+        writeFileSync(file, JSON.stringify({
+            version: STATE_VERSION, checkpoints: [], current: null, created: {}, edited: {}, deleted: {}, lastPollAt, pollKeys: []
+        }));
+        const log = capturingLogger();
+        assert.equal(GitlabState.load(file, log).lastPollAt(), null);
+        assert.deepEqual(log.lines, [], `lastPollAt ${String(lastPollAt)}`);
+    }
+});
+test('a polled head is preserved through a flush and reload', async () => {
+    const file = tempFile();
+    const first = GitlabState.load(file, capturingLogger());
+    first.setPolledHead('gitlab:group/project!58', 'e'.repeat(40));
+    await first.flush();
+    const reloaded = GitlabState.load(file, capturingLogger());
+    assert.equal(reloaded.polledHead('gitlab:group/project!58'), 'e'.repeat(40));
+    const raw = readSnapshot(file) as unknown as {
+        pollHeads: Record<string, unknown>;
+    };
+    raw.pollHeads['gitlab:group/project!59'] = 42;
+    writeFileSync(file, JSON.stringify(raw));
+    const third = GitlabState.load(file, capturingLogger());
+    assert.equal(third.polledHead('gitlab:group/project!59'), null);
+    assert.equal(third.polledHead('gitlab:group/project!58'), 'e'.repeat(40));
+});
+test('a checkpoint abandoned by an earlier rollback is refused, not accepted empty', () => {
+    const state = GitlabState.empty();
+    const a = state.createCheckpoint();
+    state.recordEditedComment({
+        repo: REPO, commentId: 5, previousBody: 'A', review: false
+    });
+    const b = state.createCheckpoint();
+    assert.equal(state.checkpointStatus(a.id), 'live');
+    assert.equal(state.checkpointStatus(b.id), 'live');
+    assert.ok(state.rollback(a.id));
+    state.recordEditedComment({
+        repo: REPO, commentId: 5, previousBody: 'A', review: false
+    });
+    assert.equal(state.checkpointStatus(b.id), 'abandoned');
+    assert.equal(state.rollback(b.id), null);
+    assert.equal(state.checkpointStatus(a.id), 'live');
+    assert.ok(state.rollback(a.id));
+    assert.equal(state.checkpointStatus('chk_never'), 'unknown');
+});
+test('state identity prevents cross-instance/account journal reuse', () => {
+    const state = GitlabState.empty();
+    state.bindIdentity('https://one.invalid', 7);
+    state.bindIdentity('https://one.invalid', 7);
+    assert.throws(() => state.bindIdentity('https://two.invalid', 7), /another instance/);
+    assert.throws(() => state.bindIdentity('https://one.invalid', 8), /numeric user/);
+    const legacy = GitlabState.empty();
+    legacy.recordCreatedComment({
+        repo: 'group/repo', commentId: 1, review: false
+    });
+    assert.throws(() => legacy.bindIdentity('https://one.invalid', 7), /unbound undo journal/);
+});

@@ -1,0 +1,21 @@
+# Example user service: systemctl --user enable --now gitlab-mcpl
+# Edit paths before installation. No unauthenticated remote TCP exposure.
+[Unit]
+Description=GitLab MCPL connector (loopback only)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/ABSOLUTE/PATH/gitlab-mcpl
+EnvironmentFile=/ABSOLUTE/PRIVATE/PATH/gitlab-mcpl/env
+ExecStart=/usr/bin/node /ABSOLUTE/PATH/gitlab-mcpl/dist/src/index.js --tcp 8787
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+StandardOutput=null
+StandardError=journal
+
+[Install]
+WantedBy=default.target

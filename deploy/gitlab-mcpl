@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Stdio launcher for an MCP/MCPL recipe. Local configuration is operator-owned.
+set -euo pipefail
+set -a
+source "${GITLAB_MCPL_ENV_FILE:-$HOME/.config/gitlab-mcpl/env}"
+set +a
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+exec node "$root/dist/src/index.js" "$@"
